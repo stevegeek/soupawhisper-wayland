@@ -115,20 +115,24 @@ poetry run python dictate.py
 
 ## Run as a systemd Service
 
-The installer can set this up automatically. If you skipped it, run:
+Use the service control script to manage SoupaWhisper as a background service:
+
+```bash
+./service.sh install   # Install and enable the service
+./service.sh start     # Start the service
+./service.sh stop      # Stop the service
+./service.sh restart   # Restart the service
+./service.sh status    # Check service status
+./service.sh logs      # Follow service logs
+./service.sh uninstall # Remove the service
+```
+
+The service will auto-start on login once installed.
+
+Alternatively, the main installer can also set up the service:
 
 ```bash
 ./install.sh  # Select 'y' when prompted for systemd
-```
-
-### Service Commands
-
-```bash
-systemctl --user start soupawhisper     # Start
-systemctl --user stop soupawhisper      # Stop
-systemctl --user restart soupawhisper   # Restart
-systemctl --user status soupawhisper    # Status
-journalctl --user -u soupawhisper -f    # View logs
 ```
 
 ## Configuration
@@ -147,7 +151,8 @@ device = cpu
 compute_type = int8
 
 [hotkey]
-# Key to hold for recording: f12, scroll_lock, pause, etc.
+# Key to hold for recording: f1-f20, scroll_lock, pause, insert, home, end, pageup, pagedown
+# Apple keyboards with extended F-keys can use f13-f20
 key = f12
 
 [behavior]
