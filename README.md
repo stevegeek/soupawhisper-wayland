@@ -2,11 +2,13 @@
 
 A simple push-to-talk voice dictation tool for Linux using faster-whisper. Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
 
+Supports both **X11** and **Wayland** (including KDE Plasma).
+
 ## Requirements
 
 - Python 3.10+
 - Poetry
-- Linux with X11 (ALSA audio)
+- Linux with X11 or Wayland (ALSA audio)
 
 ## Supported Distros
 
@@ -14,6 +16,13 @@ A simple push-to-talk voice dictation tool for Linux using faster-whisper. Hold 
 - Fedora (dnf)
 - Arch Linux (pacman)
 - openSUSE (zypper)
+
+## Supported Desktop Environments
+
+- GNOME (X11/Wayland)
+- KDE Plasma (X11/Wayland)
+- Sway, Hyprland, and other wlroots-based compositors
+- Any X11-based desktop
 
 ## Installation
 
@@ -33,6 +42,8 @@ The installer will:
 
 ### Manual Installation
 
+#### X11
+
 ```bash
 # Ubuntu/Debian
 sudo apt install alsa-utils xclip xdotool libnotify-bin
@@ -47,11 +58,29 @@ sudo pacman -S alsa-utils xclip xdotool libnotify
 poetry install
 ```
 
-### GPU Support (Optional)
-
-For NVIDIA GPU acceleration, install cuDNN 9:
+#### Wayland (KDE, GNOME, Sway, etc.)
 
 ```bash
+# Arch
+sudo pacman -S alsa-utils wl-clipboard ydotool libnotify
+
+# Enable ydotool daemon (required for auto-typing)
+systemctl --user enable --now ydotool
+
+# Add yourself to input group (for keyboard monitoring)
+sudo usermod -aG input $USER
+# Log out and back in for group changes to take effect
+
+# Then install Python deps
+poetry install
+```
+
+### GPU Support (Optional)
+
+For NVIDIA GPU acceleration with CUDA 12:
+
+```bash
+# Ubuntu/Debian
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
@@ -63,6 +92,16 @@ Then edit `~/.config/soupawhisper/config.ini`:
 device = cuda
 compute_type = float16
 ```
+
+#### CUDA 13 Users
+
+If you have CUDA 13 installed, the bundled cuBLAS/cuDNN won't work with faster-whisper (which expects CUDA 12). Install the CUDA 12 libraries via pip:
+
+```bash
+poetry run pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+The script will automatically detect and use these pip-installed libraries.
 
 ## Usage
 
