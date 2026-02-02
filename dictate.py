@@ -18,6 +18,22 @@ import os
 import select
 from pathlib import Path
 
+# System tray support using GTK AppIndicator (like Toshy)
+HAS_TRAY = False
+try:
+    import gi
+    gi.require_version('Gtk', '3.0')
+    try:
+        gi.require_version('AyatanaAppIndicator3', '0.1')
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+    except (ValueError, ImportError):
+        gi.require_version('AppIndicator3', '0.1')
+        from gi.repository import AppIndicator3
+    from gi.repository import Gtk, GLib
+    HAS_TRAY = True
+except (ImportError, ValueError) as e:
+    pass
+
 # Configure logging for systemd journal (stdout)
 # Use unbuffered output and include timestamp for debugging
 logging.basicConfig(
@@ -67,7 +83,15 @@ import evdev
 from evdev import ecodes
 from faster_whisper import WhisperModel
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
+
+# System tray icon names (using system theme icons)
+TRAY_ICONS = {
+    "ready": "audio-input-microphone",
+    "recording": "media-record",
+    "processing": "system-run",
+    "loading": "content-loading-symbolic",
+}
 
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
@@ -289,6 +313,95 @@ class Dictation:
         log.info(f"Loading Whisper model ({MODEL_SIZE}) on {DEVICE} with {COMPUTE_TYPE}...")
         threading.Thread(target=self._load_model, daemon=True).start()
 
+        # System tray icon
+        self.indicator = None
+        if HAS_TRAY:
+            self._setup_tray()
+
+    def _setup_tray(self):
+        """Set up the system tray icon with menu using GTK AppIndicator."""
+        log.debug("Setting up system tray icon (AppIndicator)")
+
+        # Create the indicator
+        self.indicator = AppIndicator3.Indicator.new(
+            "soupawhisper",
+            TRAY_ICONS["loading"],
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("SoupaWhisper - Loading...")
+
+        # Create menu
+        menu = Gtk.Menu()
+
+        # Header items (non-clickable info)
+        item_version = Gtk.MenuItem(label=f"SoupaWhisper v{__version__}")
+        item_version.set_sensitive(False)
+        menu.append(item_version)
+
+        item_hotkey = Gtk.MenuItem(label=f"Hotkey: {HOTKEY_NAME}")
+        item_hotkey.set_sensitive(False)
+        menu.append(item_hotkey)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Open Config
+        item_config = Gtk.MenuItem(label="Open Config")
+        item_config.connect("activate", self._on_open_config)
+        menu.append(item_config)
+
+        # Restart
+        item_restart = Gtk.MenuItem(label="Restart")
+        item_restart.connect("activate", self._on_restart)
+        menu.append(item_restart)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Quit
+        item_quit = Gtk.MenuItem(label="Quit")
+        item_quit.connect("activate", self._on_quit)
+        menu.append(item_quit)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+        # Run GTK main loop in background thread
+        self.gtk_thread = threading.Thread(target=self._run_gtk, daemon=True)
+        self.gtk_thread.start()
+        log.debug("System tray icon started (AppIndicator)")
+
+    def _run_gtk(self):
+        """Run GTK main loop in background."""
+        Gtk.main()
+
+    def _on_open_config(self, widget):
+        log.debug("Opening config file")
+        subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
+
+    def _on_restart(self, widget):
+        log.info("Restart requested from tray")
+        GLib.idle_add(Gtk.main_quit)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _on_quit(self, widget):
+        log.info("Quit requested from tray")
+        GLib.idle_add(Gtk.main_quit)
+        self.stop()
+
+    def _update_tray(self, state):
+        """Update tray icon based on state: 'ready', 'recording', 'processing'."""
+        if not hasattr(self, 'indicator') or not self.indicator:
+            return
+        icon = TRAY_ICONS.get(state, TRAY_ICONS["loading"])
+        titles = {
+            "ready": f"SoupaWhisper - Ready ({HOTKEY_NAME})",
+            "recording": "SoupaWhisper - Recording...",
+            "processing": "SoupaWhisper - Processing...",
+        }
+        # Use GLib.idle_add to update from main thread
+        GLib.idle_add(self.indicator.set_icon, icon)
+        GLib.idle_add(self.indicator.set_title, titles.get(state, "SoupaWhisper"))
+
     def _load_model(self):
         log.debug("Model loading thread started")
         try:
@@ -299,6 +412,7 @@ class Dictation:
             self.model_loaded.set()
             log.info(f"Model loaded successfully in {elapsed:.1f}s - Ready for dictation!")
             log.info(f"Hold [{HOTKEY_NAME}] to record, release to transcribe")
+            self._update_tray("ready")
         except Exception as e:
             self.model_error = str(e)
             self.model_loaded.set()
@@ -357,6 +471,7 @@ class Dictation:
             return
 
         self.recording = True
+        self._update_tray("recording")
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         self.temp_file.close()
         log.debug(f"Created temp file: {self.temp_file.name}")
@@ -396,6 +511,7 @@ class Dictation:
             self.record_process = None
 
         log.info("Recording stopped, transcribing...")
+        self._update_tray("processing")
 
         # Wait for model if not loaded yet
         if not self.model_loaded.is_set():
@@ -479,10 +595,16 @@ class Dictation:
             if self.temp_file and os.path.exists(self.temp_file.name):
                 log.debug(f"Cleaning up temp file: {self.temp_file.name}")
                 os.unlink(self.temp_file.name)
+            self._update_tray("ready")
 
     def stop(self):
         log.info("Shutting down...")
         self.running = False
+        if HAS_TRAY:
+            try:
+                GLib.idle_add(Gtk.main_quit)
+            except:
+                pass
         os._exit(0)
 
     def run(self):

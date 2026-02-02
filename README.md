@@ -4,6 +4,13 @@ A simple push-to-talk voice dictation tool for Linux using faster-whisper. Hold 
 
 Supports both **X11** and **Wayland** (including KDE Plasma).
 
+**Features:**
+- Push-to-talk recording with configurable hotkey (F1-F24)
+- Auto-paste into active window after transcription
+- System tray icon with status indicator (gray=loading, green=ready, red=recording)
+- Configurable audio device, language detection, and paste keys
+- Desktop notifications
+
 ## Requirements
 
 - Python 3.10+
