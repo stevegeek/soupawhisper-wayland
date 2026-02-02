@@ -150,6 +150,12 @@ device = cpu
 # Compute type: int8 for CPU, float16 for GPU
 compute_type = int8
 
+# Language detection:
+#   auto       - Full auto-detect (may detect wrong language)
+#   en         - Force English only
+#   en,it,el   - Auto-detect but limit to these languages (falls back to first if other detected)
+language = en
+
 [hotkey]
 # Key to hold for recording: f1-f20, scroll_lock, pause, insert, home, end, pageup, pagedown
 # Apple keyboards with extended F-keys can use f13-f20
@@ -161,6 +167,34 @@ auto_type = true
 
 # Show desktop notification
 notifications = true
+
+# Paste shortcut for auto-type (e.g. ctrl+v, super+v, ctrl+shift+v)
+# Note: Terminals typically use ctrl+shift+v, other apps use ctrl+v
+# The app auto-detects terminals (Konsole, Alacritty, etc.) and uses ctrl+shift+v for them
+paste_keys = ctrl+v
+
+[audio]
+# Audio device for recording
+#   default      - Use system default (may not work with PipeWire)
+#   plughw:0,0   - Use specific ALSA device directly (bypasses PipeWire)
+# Run 'arecord -l' to list available devices
+device = default
+```
+
+### Context-Aware Paste
+
+The auto-paste feature automatically detects terminal applications (Konsole, Alacritty, Kitty, etc.) and uses `Ctrl+Shift+V` for them, while using the configured `paste_keys` for other applications.
+
+### Direct Audio Device
+
+If you're using PipeWire and your microphone isn't being detected as an input source, you can bypass PipeWire by specifying the ALSA device directly:
+
+```bash
+# List available capture devices
+arecord -l
+
+# Use device from card 0, device 0
+device = plughw:0,0
 ```
 
 Create the config directory and file if it doesn't exist:
@@ -178,6 +212,29 @@ arecord -l
 
 # Test recording
 arecord -d 3 test.wav && aplay test.wav
+```
+
+**PipeWire not detecting microphone:**
+
+If your microphone shows up in `arecord -l` but not in `pactl list sources`, PipeWire isn't exposing it as an input. Configure the audio device directly in config:
+```ini
+[audio]
+device = plughw:0,0
+```
+
+**Auto-paste not working:**
+
+The paste feature uses `ydotool` which injects keyboard events at the evdev level. If you use a key remapper like Toshy/xwaykeyz:
+- ydotool bypasses the remapper, so apps see raw keycodes
+- Configure `paste_keys` to match what apps expect (usually `ctrl+v`)
+- Terminals auto-detect and use `ctrl+shift+v`
+
+**Wrong language detected:**
+
+With multilingual models (large-v3), Whisper may detect the wrong language. Configure allowed languages:
+```ini
+[whisper]
+language = en,it,el  # Only allow English, Italian, Greek
 ```
 
 **Permission issues with keyboard:**
@@ -203,3 +260,25 @@ Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
 | large-v3 | ~3GB | Slowest | Best |
 
 For dictation, `base.en` or `small.en` is usually the sweet spot.
+
+## Known Limitations
+
+### Auto-paste only works reliably in terminals
+
+The auto-paste feature uses `ydotool` to send keyboard shortcuts. Currently:
+
+- **Terminals** (Konsole, Alacritty, etc.): Auto-paste works with `Ctrl+Shift+V`
+- **Other apps** (LibreOffice, browsers, etc.): Auto-paste may not work; use manual `Cmd+V` / `Ctrl+V`
+
+The issue is that different apps expect different paste shortcuts:
+- Terminals: `Ctrl+Shift+V`
+- Regular apps: `Ctrl+V`
+- Apps with key remappers (Toshy): More complex
+
+Attempts to auto-detect the active window via KWin D-Bus (`queryWindowInfo`) cause timeouts and UI freezes.
+
+### Outstanding work
+
+- [ ] Find a reliable, non-blocking way to detect the active window class on KDE Wayland
+- [ ] Investigate alternative paste methods (Shift+Insert, menu navigation)
+- [ ] Consider app-specific paste key configuration

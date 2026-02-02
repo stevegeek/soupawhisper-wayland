@@ -11,6 +11,7 @@ import logging
 import subprocess
 import tempfile
 import threading
+import time
 import signal
 import sys
 import os
@@ -98,6 +99,9 @@ def load_config():
         "key": "f12",
         "auto_type": "true",
         "notifications": "true",
+        "audio_device": "default",
+        "paste_keys": "ctrl+v",
+        "language": "auto",
     }
 
     if CONFIG_PATH.exists():
@@ -113,8 +117,11 @@ def load_config():
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
+        "audio_device": config.get("audio", "device", fallback=defaults["audio_device"]),
+        "paste_keys": config.get("behavior", "paste_keys", fallback=defaults["paste_keys"]),
+        "language": config.get("whisper", "language", fallback=defaults["language"]),
     }
-    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}")
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}")
     return cfg
 
 
@@ -139,6 +146,102 @@ DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
+AUDIO_DEVICE = CONFIG["audio_device"]
+
+# Parse language config: "auto", "en", or "en,it,el" (comma-separated allowed languages)
+def parse_language_config(lang_str):
+    """Parse language config into (language, allowed_languages) tuple."""
+    lang_str = lang_str.strip().lower()
+    if lang_str == "auto":
+        return None, None  # Full auto-detect
+    parts = [p.strip() for p in lang_str.split(",")]
+    if len(parts) == 1:
+        return parts[0], None  # Single forced language
+    return None, parts  # Auto-detect with allowed list
+
+LANGUAGE, ALLOWED_LANGUAGES = parse_language_config(CONFIG["language"])
+if LANGUAGE:
+    log.debug(f"Language forced to: {LANGUAGE}")
+elif ALLOWED_LANGUAGES:
+    log.debug(f"Language auto-detect limited to: {ALLOWED_LANGUAGES}")
+else:
+    log.debug("Language: full auto-detect")
+
+# Keycode map for ydotool paste shortcut
+PASTE_KEYCODE_MAP = {
+    "ctrl": 29, "control": 29,
+    "alt": 56,
+    "shift": 42,
+    "super": 125, "meta": 125, "cmd": 125, "command": 125,
+    "a": 30, "b": 31, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34, "h": 35,
+    "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49, "o": 24, "p": 25,
+    "q": 16, "r": 19, "s": 31, "t": 20, "u": 22, "v": 47, "w": 17, "x": 45,
+    "y": 21, "z": 44,
+}
+
+def parse_paste_keys(paste_keys_str):
+    """Parse paste keys config (e.g. 'super+v') into ydotool args."""
+    parts = [p.strip().lower() for p in paste_keys_str.split("+")]
+    keycodes = []
+    for part in parts:
+        if part in PASTE_KEYCODE_MAP:
+            keycodes.append(PASTE_KEYCODE_MAP[part])
+        else:
+            log.warning(f"Unknown key in paste_keys: {part}")
+    if not keycodes:
+        log.warning("No valid paste keys, defaulting to Ctrl+V")
+        keycodes = [29, 47]  # Ctrl+V
+    # Build ydotool sequence: press all, release in reverse
+    args = []
+    for kc in keycodes:
+        args.append(f"{kc}:1")  # press
+    for kc in reversed(keycodes):
+        args.append(f"{kc}:0")  # release
+    return args
+
+PASTE_YDOTOOL_ARGS = parse_paste_keys(CONFIG["paste_keys"])
+PASTE_TERMINAL_ARGS = parse_paste_keys("ctrl+shift+v")
+log.debug(f"Paste keys '{CONFIG['paste_keys']}' -> ydotool args: {PASTE_YDOTOOL_ARGS}")
+
+# Terminal app classes that use Ctrl+Shift+V for paste
+TERMINAL_APPS = {
+    "org.kde.konsole", "konsole",
+    "alacritty", "org.alacritty.Alacritty",
+    "kitty", "org.kde.yakuake",
+    "gnome-terminal", "gnome-terminal-server",
+    "xfce4-terminal", "terminator", "tilix",
+    "foot", "wezterm",
+}
+
+def get_active_window_class():
+    """Get the resource class of the active window via KWin D-Bus."""
+    try:
+        result = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.kde.KWin",
+             "--object-path", "/KWin",
+             "--method", "org.kde.KWin.queryWindowInfo"],
+            capture_output=True, text=True, timeout=1
+        )
+        if result.returncode == 0:
+            # Parse resourceClass from output
+            import re
+            match = re.search(r"'resourceClass': <'([^']*)'", result.stdout)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        log.debug(f"Failed to get active window: {e}")
+    return None
+
+def get_paste_keys_for_window(window_class):
+    """Get appropriate paste keys based on window class."""
+    if window_class:
+        log.debug(f"Checking window class: {window_class}")
+        if window_class.lower() in {t.lower() for t in TERMINAL_APPS}:
+            log.debug("Using terminal paste keys (Ctrl+Shift+V)")
+            return PASTE_TERMINAL_ARGS
+    log.debug(f"Using default paste keys (Ctrl+V)")
+    return PASTE_YDOTOOL_ARGS
 
 
 def find_keyboard_devices():
@@ -180,6 +283,7 @@ class Dictation:
         self.model_error = None
         self.running = True
         self.notification_id = 0  # For replacing notifications
+        self.target_window_class = None  # Window to paste into
 
         # Load model in background
         log.info(f"Loading Whisper model ({MODEL_SIZE}) on {DEVICE} with {COMPUTE_TYPE}...")
@@ -257,17 +361,20 @@ class Dictation:
         self.temp_file.close()
         log.debug(f"Created temp file: {self.temp_file.name}")
 
-        # Record using arecord (ALSA) - works on most Linux systems
-        log.debug("Starting arecord subprocess")
+        # Record using arecord (ALSA)
+        log.debug(f"Starting arecord subprocess (device={AUDIO_DEVICE})")
+        arecord_cmd = ["arecord"]
+        if AUDIO_DEVICE != "default":
+            arecord_cmd.extend(["-D", AUDIO_DEVICE])
+        arecord_cmd.extend([
+            "-f", "S16_LE",  # Format: 16-bit little-endian
+            "-r", "16000",   # Sample rate: 16kHz (what Whisper expects)
+            "-c", "1",       # Mono
+            "-t", "wav",
+            self.temp_file.name
+        ])
         self.record_process = subprocess.Popen(
-            [
-                "arecord",
-                "-f", "S16_LE",  # Format: 16-bit little-endian
-                "-r", "16000",   # Sample rate: 16kHz (what Whisper expects)
-                "-c", "1",       # Mono
-                "-t", "wav",
-                self.temp_file.name
-            ],
+            arecord_cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -310,10 +417,26 @@ class Dictation:
             file_size = os.path.getsize(self.temp_file.name)
             log.debug(f"Audio file size: {file_size} bytes")
 
+            # Determine language for transcription
+            use_language = LANGUAGE
+            if ALLOWED_LANGUAGES and not LANGUAGE:
+                # First pass: detect language
+                _, detect_info = self.model.transcribe(
+                    self.temp_file.name, beam_size=1, vad_filter=True
+                )
+                detected = detect_info.language
+                log.debug(f"Detected language: {detected}")
+                if detected not in ALLOWED_LANGUAGES:
+                    log.info(f"Detected '{detected}' not in allowed {ALLOWED_LANGUAGES}, using '{ALLOWED_LANGUAGES[0]}'")
+                    use_language = ALLOWED_LANGUAGES[0]
+                else:
+                    use_language = detected
+
             segments, info = self.model.transcribe(
                 self.temp_file.name,
                 beam_size=5,
                 vad_filter=True,
+                language=use_language,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
@@ -336,10 +459,10 @@ class Dictation:
 
                 # Type it into the active input field
                 if AUTO_TYPE:
-                    log.debug("Auto-typing text")
+                    log.debug(f"Auto-typing with paste keys: {PASTE_YDOTOOL_ARGS}")
+                    time.sleep(0.15)  # Small delay to ensure clipboard is ready
                     if IS_WAYLAND:
-                        # Use Ctrl+V to paste from clipboard (works with any keyboard layout)
-                        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])  # Ctrl+V
+                        subprocess.run(["ydotool", "key"] + PASTE_YDOTOOL_ARGS)
                     else:
                         subprocess.run(["xdotool", "type", "--clearmodifiers", text])
 
