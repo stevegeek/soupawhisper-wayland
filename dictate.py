@@ -7,6 +7,7 @@ Supports both X11 and Wayland.
 
 import argparse
 import configparser
+import logging
 import subprocess
 import tempfile
 import threading
@@ -15,6 +16,18 @@ import sys
 import os
 import select
 from pathlib import Path
+
+# Configure logging for systemd journal (stdout)
+# Use unbuffered output and include timestamp for debugging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+# Force unbuffered stdout for systemd
+sys.stdout.reconfigure(line_buffering=True)
+log = logging.getLogger("soupawhisper")
 
 # Preload CUDA libraries from pip packages before importing faster_whisper
 def preload_cuda_libs():
@@ -27,21 +40,25 @@ def preload_cuda_libs():
 
         # Find and load cublas
         cublas_path = nvidia.cublas.lib.__path__[0]
+        log.debug(f"Loading CUDA cublas from: {cublas_path}")
         for lib in glob.glob(f"{cublas_path}/libcublas.so*"):
             try:
                 ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
+                log.debug(f"Loaded: {lib}")
+            except OSError as e:
+                log.debug(f"Failed to load {lib}: {e}")
 
         # Find and load cudnn
         cudnn_path = nvidia.cudnn.lib.__path__[0]
+        log.debug(f"Loading CUDA cudnn from: {cudnn_path}")
         for lib in glob.glob(f"{cudnn_path}/libcudnn*.so*"):
             try:
                 ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
+                log.debug(f"Loaded: {lib}")
+            except OSError as e:
+                log.debug(f"Failed to load {lib}: {e}")
     except ImportError:
-        pass  # CUDA libs not installed via pip, use system libs
+        log.debug("CUDA libs not installed via pip, using system libs")
 
 preload_cuda_libs()
 
@@ -84,9 +101,12 @@ def load_config():
     }
 
     if CONFIG_PATH.exists():
+        log.debug(f"Loading config from: {CONFIG_PATH}")
         config.read(CONFIG_PATH)
+    else:
+        log.debug(f"Config file not found, using defaults: {CONFIG_PATH}")
 
-    return {
+    cfg = {
         "model": config.get("whisper", "model", fallback=defaults["model"]),
         "device": config.get("whisper", "device", fallback=defaults["device"]),
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
@@ -94,6 +114,8 @@ def load_config():
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
     }
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}")
+    return cfg
 
 
 CONFIG = load_config()
@@ -103,9 +125,10 @@ def get_hotkey_code(key_name):
     """Map key name to evdev keycode."""
     key_name = key_name.lower()
     if key_name in KEY_MAP:
+        log.debug(f"Mapped hotkey '{key_name}' to keycode {KEY_MAP[key_name]}")
         return KEY_MAP[key_name]
     else:
-        print(f"Unknown key: {key_name}, defaulting to f12")
+        log.warning(f"Unknown key: {key_name}, defaulting to F12")
         return ecodes.KEY_F12
 
 
@@ -120,8 +143,11 @@ NOTIFICATIONS = CONFIG["notifications"]
 
 def find_keyboard_devices():
     """Find keyboard input devices."""
+    log.debug("Scanning for keyboard input devices...")
     devices = []
-    for path in evdev.list_devices():
+    all_devices = evdev.list_devices()
+    log.debug(f"Found {len(all_devices)} input devices total")
+    for path in all_devices:
         try:
             device = evdev.InputDevice(path)
             caps = device.capabilities()
@@ -130,13 +156,22 @@ def find_keyboard_devices():
                 keys = caps[ecodes.EV_KEY]
                 if ecodes.KEY_F1 in keys or ecodes.KEY_F10 in keys:
                     devices.append(device)
-        except (PermissionError, OSError):
-            continue
+                    log.debug(f"Added keyboard device: {device.name} ({path})")
+                else:
+                    log.debug(f"Skipped (no F-keys): {device.name} ({path})")
+            else:
+                log.debug(f"Skipped (no EV_KEY): {path}")
+        except PermissionError:
+            log.warning(f"Permission denied: {path}")
+        except OSError as e:
+            log.debug(f"OSError for {path}: {e}")
+    log.info(f"Found {len(devices)} keyboard device(s)")
     return devices
 
 
 class Dictation:
     def __init__(self):
+        log.debug("Initializing Dictation instance")
         self.recording = False
         self.record_process = None
         self.temp_file = None
@@ -147,27 +182,32 @@ class Dictation:
         self.notification_id = 0  # For replacing notifications
 
         # Load model in background
-        print(f"Loading Whisper model ({MODEL_SIZE})...")
+        log.info(f"Loading Whisper model ({MODEL_SIZE}) on {DEVICE} with {COMPUTE_TYPE}...")
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def _load_model(self):
+        log.debug("Model loading thread started")
         try:
+            import time
+            start_time = time.time()
             self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+            elapsed = time.time() - start_time
             self.model_loaded.set()
-            print(f"Model loaded. Ready for dictation!")
-            print(f"Hold [{HOTKEY_NAME}] to record, release to transcribe.")
-            print("Press Ctrl+C to quit.")
+            log.info(f"Model loaded successfully in {elapsed:.1f}s - Ready for dictation!")
+            log.info(f"Hold [{HOTKEY_NAME}] to record, release to transcribe")
         except Exception as e:
             self.model_error = str(e)
             self.model_loaded.set()
-            print(f"Failed to load model: {e}")
+            log.error(f"Failed to load model: {e}")
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
-                print("Hint: Try setting device = cpu in your config, or install cuDNN.")
+                log.error("Hint: Try setting device = cpu in your config, or install cuDNN.")
 
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification that replaces the previous one."""
         if not NOTIFICATIONS:
+            log.debug(f"Notification suppressed (disabled): {title}")
             return
+        log.debug(f"Sending notification: {title} - {message}")
         try:
             # Use gdbus to call notification daemon directly - supports replacement on KDE
             result = subprocess.run(
@@ -177,7 +217,7 @@ class Dictation:
                     "--object-path", "/org/freedesktop/Notifications",
                     "--method", "org.freedesktop.Notifications.Notify",
                     "SoupaWhisper",  # app_name
-                    str(self.notification_id),  # replaces_id (0 = new, >0 = replace)
+                    "0",  # replaces_id (always new - KDE doesn't show replaced notifications after dismiss)
                     icon,  # app_icon
                     title,  # summary
                     message,  # body
@@ -195,7 +235,9 @@ class Dictation:
                 match = re.search(r'\(uint32 (\d+),\)', result.stdout)
                 if match:
                     self.notification_id = int(match.group(1))
-        except Exception:
+                    log.debug(f"Notification sent with id={self.notification_id}")
+        except Exception as e:
+            log.debug(f"gdbus notification failed: {e}, falling back to notify-send")
             # Fallback to notify-send
             subprocess.run(
                 ["notify-send", "-a", "SoupaWhisper", "-i", icon, "-t", str(timeout), title, message],
@@ -203,14 +245,20 @@ class Dictation:
             )
 
     def start_recording(self):
-        if self.recording or self.model_error:
+        if self.recording:
+            log.debug("start_recording called but already recording, ignoring")
+            return
+        if self.model_error:
+            log.warning("start_recording called but model failed to load")
             return
 
         self.recording = True
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         self.temp_file.close()
+        log.debug(f"Created temp file: {self.temp_file.name}")
 
         # Record using arecord (ALSA) - works on most Linux systems
+        log.debug("Starting arecord subprocess")
         self.record_process = subprocess.Popen(
             [
                 "arecord",
@@ -223,32 +271,45 @@ class Dictation:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
-        print("Recording...")
+        log.info(f"Recording started (pid={self.record_process.pid})")
         self.notify("Recording...", f"Release {HOTKEY_NAME} when done", "audio-input-microphone", 30000)
 
     def stop_recording(self):
         if not self.recording:
+            log.debug("stop_recording called but not recording, ignoring")
             return
 
         self.recording = False
+        log.debug("Stopping recording")
 
         if self.record_process:
+            log.debug(f"Terminating arecord (pid={self.record_process.pid})")
             self.record_process.terminate()
             self.record_process.wait()
             self.record_process = None
 
-        print("Transcribing...")
+        log.info("Recording stopped, transcribing...")
 
         # Wait for model if not loaded yet
+        if not self.model_loaded.is_set():
+            log.debug("Waiting for model to finish loading...")
         self.model_loaded.wait()
 
         if self.model_error:
-            print(f"Cannot transcribe: model failed to load")
+            log.error(f"Cannot transcribe: model failed to load")
             self.notify("Error", "Model failed to load", "dialog-error", 3000)
             return
 
         # Transcribe
         try:
+            import time
+            start_time = time.time()
+            log.debug(f"Starting transcription of {self.temp_file.name}")
+
+            # Check file size
+            file_size = os.path.getsize(self.temp_file.name)
+            log.debug(f"Audio file size: {file_size} bytes")
+
             segments, info = self.model.transcribe(
                 self.temp_file.name,
                 beam_size=5,
@@ -256,9 +317,14 @@ class Dictation:
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
+            elapsed = time.time() - start_time
+            log.debug(f"Transcription completed in {elapsed:.2f}s")
 
             if text:
+                log.info(f"Transcribed ({len(text)} chars): {text[:80]}{'...' if len(text) > 80 else ''}")
+
                 # Copy to clipboard
+                log.debug(f"Copying to clipboard ({'Wayland' if IS_WAYLAND else 'X11'})")
                 if IS_WAYLAND:
                     process = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
                 else:
@@ -270,28 +336,29 @@ class Dictation:
 
                 # Type it into the active input field
                 if AUTO_TYPE:
+                    log.debug("Auto-typing text")
                     if IS_WAYLAND:
                         # Use Ctrl+V to paste from clipboard (works with any keyboard layout)
                         subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])  # Ctrl+V
                     else:
                         subprocess.run(["xdotool", "type", "--clearmodifiers", text])
 
-                print(f"Copied: {text}")
                 self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
             else:
-                print("No speech detected")
+                log.warning("No speech detected in recording")
                 self.notify("No speech detected", "Try speaking louder", "dialog-warning", 2000)
 
         except Exception as e:
-            print(f"Error: {e}")
+            log.error(f"Transcription error: {e}", exc_info=True)
             self.notify("Error", str(e)[:50], "dialog-error", 3000)
         finally:
             # Cleanup temp file
             if self.temp_file and os.path.exists(self.temp_file.name):
+                log.debug(f"Cleaning up temp file: {self.temp_file.name}")
                 os.unlink(self.temp_file.name)
 
     def stop(self):
-        print("\nExiting...")
+        log.info("Shutting down...")
         self.running = False
         os._exit(0)
 
@@ -299,19 +366,20 @@ class Dictation:
         """Main event loop using evdev for keyboard input."""
         devices = find_keyboard_devices()
         if not devices:
-            print("Error: No keyboard devices found.")
-            print("Make sure you have permission to read /dev/input/event* devices.")
-            print("You may need to add your user to the 'input' group:")
-            print("  sudo usermod -aG input $USER")
-            print("Then log out and back in.")
+            log.error("No keyboard devices found")
+            log.error("Make sure you have permission to read /dev/input/event* devices")
+            log.error("You may need to add your user to the 'input' group:")
+            log.error("  sudo usermod -aG input $USER")
+            log.error("Then log out and back in.")
             sys.exit(1)
 
-        print(f"Monitoring {len(devices)} keyboard device(s)...")
+        log.info(f"Monitoring {len(devices)} keyboard device(s):")
         for d in devices:
-            print(f"  - {d.name}")
+            log.info(f"  - {d.name}")
 
         # Create a dict mapping fd to device
         fd_to_device = {dev.fd: dev for dev in devices}
+        log.debug(f"Event loop starting, waiting for {HOTKEY_NAME} key events...")
 
         while self.running:
             # Use select to wait for events from any device
@@ -322,8 +390,10 @@ class Dictation:
                     for event in device.read():
                         if event.type == ecodes.EV_KEY and event.code == HOTKEY_CODE:
                             if event.value == 1:  # Key pressed
+                                log.debug(f"Hotkey {HOTKEY_NAME} pressed")
                                 self.start_recording()
                             elif event.value == 0:  # Key released
+                                log.debug(f"Hotkey {HOTKEY_NAME} released")
                                 self.stop_recording()
                 except BlockingIOError:
                     pass
@@ -331,34 +401,46 @@ class Dictation:
 
 def check_dependencies():
     """Check that required system commands are available."""
+    log.debug("Checking system dependencies...")
     missing = []
 
     # Audio recording
     if subprocess.run(["which", "arecord"], capture_output=True).returncode != 0:
         missing.append(("arecord", "alsa-utils"))
+    else:
+        log.debug("Found: arecord")
 
     # Clipboard
     if IS_WAYLAND:
         if subprocess.run(["which", "wl-copy"], capture_output=True).returncode != 0:
             missing.append(("wl-copy", "wl-clipboard"))
+        else:
+            log.debug("Found: wl-copy")
     else:
         if subprocess.run(["which", "xclip"], capture_output=True).returncode != 0:
             missing.append(("xclip", "xclip"))
+        else:
+            log.debug("Found: xclip")
 
     # Auto-typing
     if AUTO_TYPE:
         if IS_WAYLAND:
             if subprocess.run(["which", "ydotool"], capture_output=True).returncode != 0:
                 missing.append(("ydotool", "ydotool"))
+            else:
+                log.debug("Found: ydotool")
         else:
             if subprocess.run(["which", "xdotool"], capture_output=True).returncode != 0:
                 missing.append(("xdotool", "xdotool"))
+            else:
+                log.debug("Found: xdotool")
 
     if missing:
-        print("Missing dependencies:")
+        log.error("Missing dependencies:")
         for cmd, pkg in missing:
-            print(f"  {cmd} - install: sudo pacman -S {pkg}")
+            log.error(f"  {cmd} - install: sudo pacman -S {pkg}")
         sys.exit(1)
+    log.debug("All dependencies satisfied")
 
 
 def main():
@@ -372,10 +454,10 @@ def main():
     )
     parser.parse_args()
 
-    print(f"SoupaWhisper v{__version__}")
-    print(f"Session: {'Wayland' if IS_WAYLAND else 'X11'}")
-    print(f"Config: {CONFIG_PATH}")
-    print(f"Hotkey: {HOTKEY_NAME}")
+    log.info(f"SoupaWhisper v{__version__} starting")
+    log.info(f"Session type: {'Wayland' if IS_WAYLAND else 'X11'}")
+    log.info(f"Config file: {CONFIG_PATH}")
+    log.info(f"Hotkey: {HOTKEY_NAME}")
 
     check_dependencies()
 
@@ -383,9 +465,12 @@ def main():
 
     # Handle Ctrl+C gracefully
     def handle_sigint(sig, frame):
+        log.debug("Received SIGINT")
         dictation.stop()
 
     signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
+    log.debug("Signal handlers installed (SIGINT, SIGTERM)")
 
     dictation.run()
 
