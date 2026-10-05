@@ -268,11 +268,11 @@ def get_paste_keys_for_window(window_class):
     return PASTE_YDOTOOL_ARGS
 
 
-def find_keyboard_devices():
-    """Find keyboard input devices."""
+def find_keyboard_devices(paths=None):
+    """Find keyboard input devices (among `paths`, or all input devices)."""
     log.debug("Scanning for keyboard input devices...")
     devices = []
-    all_devices = evdev.list_devices()
+    all_devices = evdev.list_devices() if paths is None else list(paths)
     log.debug(f"Found {len(all_devices)} input devices total")
     for path in all_devices:
         try:
@@ -624,9 +624,23 @@ class Dictation:
 
         # Create a dict mapping fd to device
         fd_to_device = {dev.fd: dev for dev in devices}
+        # Virtual keyboards (RustDesk, Toshy/xwaykeyz, ydotoold) get destroyed and
+        # re-created at runtime, so watch for new devices and drop vanished ones.
+        known_paths = set(evdev.list_devices())
+        last_scan = time.monotonic()
         log.debug(f"Event loop starting, waiting for {HOTKEY_NAME} key events...")
 
         while self.running:
+            if time.monotonic() - last_scan >= 1.0:
+                last_scan = time.monotonic()
+                current_paths = set(evdev.list_devices())
+                new_paths = current_paths - known_paths
+                known_paths = current_paths
+                if new_paths:
+                    for dev in find_keyboard_devices(new_paths):
+                        log.info(f"Now monitoring keyboard device: {dev.name} ({dev.path})")
+                        fd_to_device[dev.fd] = dev
+
             # Use select to wait for events from any device
             r, _, _ = select.select(fd_to_device.keys(), [], [], 0.1)
             for fd in r:
@@ -642,6 +656,15 @@ class Dictation:
                                 self.stop_recording()
                 except BlockingIOError:
                     pass
+                except OSError as e:
+                    log.warning(f"Keyboard device gone, no longer monitoring: {device.name} ({device.path}): {e}")
+                    del fd_to_device[fd]
+                    # Forget the path so a re-created device reusing it gets picked up
+                    known_paths.discard(device.path)
+                    try:
+                        device.close()
+                    except OSError:
+                        pass
 
 
 def check_dependencies():
