@@ -16,6 +16,7 @@ import signal
 import sys
 import os
 import select
+from enum import Enum
 from pathlib import Path
 
 # System tray support using GTK AppIndicator (like Toshy)
@@ -126,6 +127,7 @@ def load_config():
         "audio_device": "default",
         "paste_keys": "ctrl+v",
         "language": "auto",
+        "long_press": 0.4,
     }
 
     if CONFIG_PATH.exists():
@@ -144,8 +146,9 @@ def load_config():
         "audio_device": config.get("audio", "device", fallback=defaults["audio_device"]),
         "paste_keys": config.get("behavior", "paste_keys", fallback=defaults["paste_keys"]),
         "language": config.get("whisper", "language", fallback=defaults["language"]),
+        "long_press": config.getfloat("behavior", "long_press", fallback=defaults["long_press"]),
     }
-    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}")
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, long_press={cfg['long_press']}")
     return cfg
 
 
@@ -171,6 +174,14 @@ COMPUTE_TYPE = CONFIG["compute_type"]
 AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 AUDIO_DEVICE = CONFIG["audio_device"]
+LONG_PRESS = CONFIG["long_press"]
+
+
+class State(Enum):
+    IDLE = "idle"
+    HOLDING = "holding"
+    TOGGLED = "toggled"
+    STOPPING = "stopping"
 
 # Parse language config: "auto", "en", or "en,it,el" (comma-separated allowed languages)
 def parse_language_config(lang_str):
@@ -306,6 +317,11 @@ class Dictation:
         self.model_loaded = threading.Event()
         self.model_error = None
         self.running = True
+        # Toggle vs. hold-to-record state
+        self.state = State.IDLE
+        self.key_down = False
+        self.key_device_path = None  # Device the hotkey is held on
+        self.press_time = 0.0
         self.notification_id = 0  # For replacing notifications
         self.target_window_class = None  # Window to paste into
 
@@ -597,6 +613,38 @@ class Dictation:
                 os.unlink(self.temp_file.name)
             self._update_tray("ready")
 
+    def on_hotkey_press(self, device_path):
+        if self.key_down:  # same press seen on another device
+            return
+        self.key_down = True
+        self.key_device_path = device_path
+        self.press_time = time.monotonic()
+        if self.state is State.IDLE:
+            self.start_recording()  # always start recording
+            if self.recording:
+                self.state = State.HOLDING
+        elif self.state in (State.TOGGLED, State.HOLDING):
+            # HOLDING here means the release was lost with its device
+            self.state = State.STOPPING  # will stop on release
+
+    def on_hotkey_release(self):
+        if not self.key_down:
+            return
+        self.key_down = False
+        self.key_device_path = None
+        duration = time.monotonic() - self.press_time
+        if self.state is State.HOLDING:
+            if duration < LONG_PRESS:
+                self.state = State.TOGGLED  # tap → stay recording
+                log.info(f"Toggle mode: recording until {HOTKEY_NAME} is tapped again")
+                self.notify("Recording...", f"Tap {HOTKEY_NAME} again to stop", "audio-input-microphone", 30000)
+            else:
+                self.state = State.IDLE
+                self.stop_recording()  # hold → stop
+        elif self.state is State.STOPPING:
+            self.state = State.IDLE
+            self.stop_recording()  # second press → stop
+
     def stop(self):
         log.info("Shutting down...")
         self.running = False
@@ -650,10 +698,10 @@ class Dictation:
                         if event.type == ecodes.EV_KEY and event.code == HOTKEY_CODE:
                             if event.value == 1:  # Key pressed
                                 log.debug(f"Hotkey {HOTKEY_NAME} pressed")
-                                self.start_recording()
+                                self.on_hotkey_press(device.path)
                             elif event.value == 0:  # Key released
                                 log.debug(f"Hotkey {HOTKEY_NAME} released")
-                                self.stop_recording()
+                                self.on_hotkey_release()
                 except BlockingIOError:
                     pass
                 except OSError as e:
@@ -661,6 +709,10 @@ class Dictation:
                     del fd_to_device[fd]
                     # Forget the path so a re-created device reusing it gets picked up
                     known_paths.discard(device.path)
+                    if self.key_down and self.key_device_path == device.path:
+                        # Its release will never arrive; don't ignore the next press
+                        self.key_down = False
+                        self.key_device_path = None
                     try:
                         device.close()
                     except OSError:
