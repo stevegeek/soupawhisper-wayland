@@ -128,6 +128,7 @@ def load_config():
         "paste_keys": "ctrl+v",
         "language": "auto",
         "long_press": 0.4,
+        "record_mode": "auto",
     }
 
     if CONFIG_PATH.exists():
@@ -147,10 +148,18 @@ def load_config():
         "paste_keys": config.get("behavior", "paste_keys", fallback=defaults["paste_keys"]),
         "language": config.get("whisper", "language", fallback=defaults["language"]),
         "long_press": config.getfloat("behavior", "long_press", fallback=defaults["long_press"]),
+        "record_mode": config.get("behavior", "record_mode", fallback=defaults["record_mode"]).strip().lower(),
     }
-    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, long_press={cfg['long_press']}")
+    if cfg["record_mode"] not in RECORD_MODES:
+        log.warning(f"Unknown record_mode: {cfg['record_mode']}, expected one of {', '.join(RECORD_MODES)}; using auto")
+        cfg["record_mode"] = "auto"
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, record_mode={cfg['record_mode']}, long_press={cfg['long_press']}")
     return cfg
 
+
+# hold: record while held; toggle: tap to start, tap to stop;
+# auto: a tap shorter than long_press toggles, a longer hold records while held
+RECORD_MODES = ("auto", "hold", "toggle")
 
 CONFIG = load_config()
 
@@ -175,6 +184,7 @@ AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 AUDIO_DEVICE = CONFIG["audio_device"]
 LONG_PRESS = CONFIG["long_press"]
+RECORD_MODE = CONFIG["record_mode"]
 
 
 class State(Enum):
@@ -436,6 +446,21 @@ class Dictation:
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 log.error("Hint: Try setting device = cpu in your config, or install cuDNN.")
 
+    def close_notification(self):
+        """Close the most recent notification, if any."""
+        if not NOTIFICATIONS or not self.notification_id:
+            return
+        subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.freedesktop.Notifications",
+                "--object-path", "/org/freedesktop/Notifications",
+                "--method", "org.freedesktop.Notifications.CloseNotification",
+                str(self.notification_id),
+            ],
+            capture_output=True
+        )
+
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification that replaces the previous one."""
         if not NOTIFICATIONS:
@@ -510,7 +535,11 @@ class Dictation:
             stderr=subprocess.DEVNULL
         )
         log.info(f"Recording started (pid={self.record_process.pid})")
-        self.notify("Recording...", f"Release {HOTKEY_NAME} when done", "audio-input-microphone", 30000)
+        if RECORD_MODE == "toggle":
+            hint = f"Tap {HOTKEY_NAME} again to stop"
+        else:
+            hint = f"Release {HOTKEY_NAME} when done"
+        self.notify("Recording...", hint, "audio-input-microphone", 30000)
 
     def stop_recording(self):
         if not self.recording:
@@ -634,9 +663,13 @@ class Dictation:
         self.key_device_path = None
         duration = time.monotonic() - self.press_time
         if self.state is State.HOLDING:
-            if duration < LONG_PRESS:
+            if RECORD_MODE == "toggle":
+                self.state = State.TOGGLED  # first press → keep recording
+            elif RECORD_MODE == "auto" and duration < LONG_PRESS:
                 self.state = State.TOGGLED  # tap → stay recording
                 log.info(f"Toggle mode: recording until {HOTKEY_NAME} is tapped again")
+                # Swap the "Release ... when done" notification shown at start
+                self.close_notification()
                 self.notify("Recording...", f"Tap {HOTKEY_NAME} again to stop", "audio-input-microphone", 30000)
             else:
                 self.state = State.IDLE

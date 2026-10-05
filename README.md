@@ -118,6 +118,7 @@ poetry run python dictate.py
 
 - Hold **F12** to record
 - Release to transcribe → copies to clipboard and types into active input
+- Or tap **F12** to start recording and tap again to transcribe (see `record_mode`)
 - Press **Ctrl+C** to quit (when running manually)
 
 ## Run as a systemd Service
@@ -179,6 +180,15 @@ notifications = true
 # Note: Terminals typically use ctrl+shift+v, other apps use ctrl+v
 # The app auto-detects terminals (Konsole, Alacritty, etc.) and uses ctrl+shift+v for them
 paste_keys = ctrl+v
+
+# Recording mode:
+#   hold   - hold the key to record, release to transcribe
+#   toggle - tap the key to start recording, tap again to transcribe
+#   auto   - a quick tap toggles, a longer hold records while held
+record_mode = auto
+
+# auto mode only: seconds before entering "hold-to-record" mode, otherwise "toggle" mode
+long_press = 0.4
 
 [audio]
 # Audio device for recording
